@@ -8,12 +8,11 @@ from collections import defaultdict, deque
 from contextlib import closing
 
 import requests
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, Response
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024
 
-# ---------- ENV (optional - defaults already set) ----------
 API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 FRONTEND_ORIGIN = os.environ.get("FRONTEND_ORIGIN", "").rstrip("/")
 UNLOCK_CODE = os.environ.get("UNLOCK_CODE", "x1pro-7k29x").strip()
@@ -23,6 +22,10 @@ DB_PATH = os.environ.get("DB_PATH", "x1.db")
 UPI_ID = os.environ.get("UPI_ID", "9625399958@fam").strip()
 UPI_NAME = os.environ.get("UPI_NAME", "X1").strip()
 PRICE_PAISE = int(os.environ.get("PRICE_PAISE", "9900"))
+PREMIUM_DAYS = int(os.environ.get("PREMIUM_DAYS", "30"))
+
+UTR_MODE = os.environ.get("UTR_MODE", "approve").strip().lower()
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "x1admin-9k3").strip()
 
 RAZORPAY_KEY_ID = os.environ.get("RAZORPAY_KEY_ID", "").strip()
 RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET", "").strip()
@@ -76,14 +79,24 @@ def init_db():
         c.execute("""CREATE TABLE IF NOT EXISTS users (
             uid TEXT PRIMARY KEY,
             premium INTEGER DEFAULT 0,
+            premium_until REAL DEFAULT 0,
             used INTEGER DEFAULT 0,
             created REAL
         )""")
         c.execute("""CREATE TABLE IF NOT EXISTS payments (
             utr TEXT PRIMARY KEY,
             uid TEXT,
-            ts REAL
+            ts REAL,
+            status TEXT DEFAULT 'pending'
         )""")
+        for sql in (
+            "ALTER TABLE users ADD COLUMN premium_until REAL DEFAULT 0",
+            "ALTER TABLE payments ADD COLUMN status TEXT DEFAULT 'pending'",
+        ):
+            try:
+                c.execute(sql)
+            except sqlite3.OperationalError:
+                pass
         c.commit()
 
 
@@ -96,11 +109,11 @@ def get_user(uid):
         if row:
             return dict(row)
         c.execute(
-            "INSERT INTO users (uid, premium, used, created) VALUES (?, 0, 0, ?)",
+            "INSERT INTO users (uid, premium, premium_until, used, created) VALUES (?, 0, 0, 0, ?)",
             (uid, time.time()),
         )
         c.commit()
-        return {"uid": uid, "premium": 0, "used": 0}
+        return {"uid": uid, "premium": 0, "premium_until": 0, "used": 0}
 
 
 def bump_usage(uid):
@@ -109,10 +122,25 @@ def bump_usage(uid):
         c.commit()
 
 
-def set_premium(uid):
+def is_premium(u):
+    return (u.get("premium_until") or 0) > time.time()
+
+
+def grant_premium(uid, days=None):
+    """Premium de do. Agar pehle se active hai to uske upar add hoga (renew)."""
+    days = days or PREMIUM_DAYS
     with closing(db()) as c:
-        c.execute("UPDATE users SET premium = 1 WHERE uid=?", (uid,))
+        row = c.execute("SELECT premium_until FROM users WHERE uid=?", (uid,)).fetchone()
+        base = time.time()
+        if row and (row["premium_until"] or 0) > base:
+            base = row["premium_until"]
+        until = base + days * 86400
+        c.execute(
+            "UPDATE users SET premium=1, premium_until=?, used=0 WHERE uid=?",
+            (until, uid),
+        )
         c.commit()
+    return until
 
 
 def current_uid():
@@ -120,10 +148,15 @@ def current_uid():
     return uid[:64] if uid else "anon"
 
 
+def same_origin():
+    origin = request.headers.get("Origin", "").rstrip("/")
+    return origin and origin == request.host_url.rstrip("/")
+
+
 @app.after_request
 def add_cors_headers(response):
     origin = request.headers.get("Origin", "").rstrip("/")
-    if origin and (not FRONTEND_ORIGIN or origin == FRONTEND_ORIGIN):
+    if origin and (not FRONTEND_ORIGIN or origin == FRONTEND_ORIGIN or same_origin()):
         response.headers["Access-Control-Allow-Origin"] = origin
         response.headers["Vary"] = "Origin"
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
@@ -137,7 +170,7 @@ def guard():
         return ("", 204)
     if request.path.startswith("/api/"):
         origin = request.headers.get("Origin", "").rstrip("/")
-        if FRONTEND_ORIGIN and origin and origin != FRONTEND_ORIGIN:
+        if FRONTEND_ORIGIN and origin and origin != FRONTEND_ORIGIN and not same_origin():
             return jsonify({"error": "Origin not allowed"}), 403
     return None
 
@@ -146,15 +179,30 @@ def guard():
 def status():
     uid = current_uid()
     u = get_user(uid)
-    remaining = 0 if u["premium"] else max(0, FREE_LIMIT - u["used"])
+    p = is_premium(u)
+    remaining = 0 if p else max(0, FREE_LIMIT - u["used"])
+    until = u.get("premium_until") or 0
+    days_left = 0
+    if p:
+        days_left = int(((until - time.time()) + 86399) // 86400)
+    pend = None
+    with closing(db()) as c:
+        row = c.execute(
+            "SELECT utr FROM payments WHERE uid=? AND status='pending'", (uid,)
+        ).fetchone()
+        if row:
+            pend = row["utr"]
     return jsonify({
-        "premium": bool(u["premium"]),
+        "premium": p,
+        "days_left": days_left,
+        "premium_until": until,
         "used": u["used"],
         "limit": FREE_LIMIT,
         "remaining": remaining,
         "upi": UPI_ID,
         "upi_name": UPI_NAME,
         "price": PRICE_PAISE / 100,
+        "pending_utr": pend,
         "razorpay": bool(RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET),
     })
 
@@ -170,17 +218,26 @@ def claim():
     uid = current_uid()
 
     with closing(db()) as c:
-        row = c.execute("SELECT uid FROM payments WHERE utr=?", (utr,)).fetchone()
+        row = c.execute("SELECT uid, status FROM payments WHERE utr=?", (utr,)).fetchone()
+
         if row and row["uid"] != uid:
             return jsonify({"success": False, "error": "Ye UTR pehle use ho chuka hai"}), 400
-        c.execute(
-            "INSERT OR IGNORE INTO payments (utr, uid, ts) VALUES (?, ?, ?)",
-            (utr, uid, time.time()),
-        )
-        c.commit()
 
-    set_premium(uid)
-    return jsonify({"success": True, "premium": True})
+        if row:
+            state = row["status"]
+        else:
+            state = "approved" if UTR_MODE == "instant" else "pending"
+            c.execute(
+                "INSERT INTO payments (utr, uid, ts, status) VALUES (?, ?, ?, ?)",
+                (utr, uid, time.time(), state),
+            )
+            c.commit()
+
+    if state == "approved":
+        grant_premium(uid)
+        return jsonify({"success": True, "pending": False, "premium": True})
+
+    return jsonify({"success": True, "pending": True, "premium": False})
 
 
 @app.post("/api/unlock")
@@ -189,8 +246,99 @@ def unlock():
     code = str(body.get("code", "")).strip()
     if not UNLOCK_CODE or code != UNLOCK_CODE:
         return jsonify({"success": False, "error": "Galat code"}), 400
-    set_premium(current_uid())
+    grant_premium(current_uid())
     return jsonify({"success": True, "premium": True})
+
+
+def admin_ok():
+    return (request.args.get("key") or (request.get_json(silent=True) or {}).get("key", "")) == ADMIN_KEY
+
+
+@app.get("/api/admin/list")
+def admin_list():
+    if not admin_ok():
+        return jsonify({"error": "Bad key"}), 401
+    with closing(db()) as c:
+        rows = c.execute(
+            """SELECT p.utr, p.uid, p.ts, p.status, u.premium_until
+               FROM payments p LEFT JOIN users u ON u.uid = p.uid
+               ORDER BY p.ts DESC LIMIT 200"""
+        ).fetchall()
+    out = []
+    for r in rows:
+        d = dict(r)
+        until = d.pop("premium_until", 0) or 0
+        d["premium_days_left"] = int(((until - time.time()) + 86399) // 86400) if until > time.time() else 0
+        out.append(d)
+    return jsonify({"claims": out})
+
+
+@app.post("/api/admin/approve")
+def admin_approve():
+    body = request.get_json(silent=True) or {}
+    if body.get("key", "") != ADMIN_KEY:
+        return jsonify({"error": "Bad key"}), 401
+    utr = re.sub(r"\D", "", str(body.get("utr", "")))
+    days = int(body.get("days") or PREMIUM_DAYS)
+    with closing(db()) as c:
+        row = c.execute("SELECT uid FROM payments WHERE utr=?", (utr,)).fetchone()
+        if not row:
+            return jsonify({"error": "UTR nahi mila"}), 404
+        c.execute("UPDATE payments SET status='approved' WHERE utr=?", (utr,))
+        c.commit()
+        uid = row["uid"]
+    grant_premium(uid, days)
+    return jsonify({"success": True, "days": days})
+
+
+@app.post("/api/admin/reject")
+def admin_reject():
+    body = request.get_json(silent=True) or {}
+    if body.get("key", "") != ADMIN_KEY:
+        return jsonify({"error": "Bad key"}), 401
+    utr = re.sub(r"\D", "", str(body.get("utr", "")))
+    with closing(db()) as c:
+        c.execute("DELETE FROM payments WHERE utr=?", (utr,))
+        c.commit()
+    return jsonify({"success": True})
+
+
+ADMIN_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>X1 admin</title>
+<style>body{background:#0b0d12;color:#e8eaf0;font-family:system-ui;padding:16px;max-width:600px;margin:auto}
+input,button{padding:10px;border-radius:9px;border:1px solid #232a3a;background:#0e1117;color:#e8eaf0;font-size:14px}
+button{background:linear-gradient(135deg,#22d3ee,#a78bfa);color:#080a0f;font-weight:600;border:none;cursor:pointer}
+.card{border:1px solid #1e2433;border-radius:11px;padding:12px;margin:10px 0;font-size:13px}
+.utr{font-family:monospace;font-size:16px;color:#22d3ee}.ok{color:#22c55e}.pend{color:#f59e0b}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.row input{flex:1}
+</style></head><body>
+<h2 style="margin-bottom:12px">X1 admin</h2>
+<div class="row"><input id="k" placeholder="admin key"><button onclick="load()">Load</button></div>
+<div id="out"></div>
+<script>
+async function load(){
+  const key=document.getElementById('k').value.trim();localStorage.x1akey=key;
+  const r=await fetch('/api/admin/list?key='+encodeURIComponent(key));
+  const j=await r.json();
+  if(!j.claims){document.getElementById('out').innerHTML='<p>Bad key</p>';return;}
+  document.getElementById('out').innerHTML=j.claims.length?j.claims.map(c=>
+   '<div class="card"><div class="utr">'+c.utr+'</div><div>uid: '+c.uid+'</div><div class="'+(c.status==='approved'?'ok':'pend')+'">'+c.status+
+   (c.premium_days_left?' &middot; '+c.premium_days_left+' din baaki':'')+'</div><div class="row" style="margin-top:8px">'+
+   (c.status==='pending'?'<button onclick="act(\\'approve\\',\\''+c.utr+'\\')">Approve 30 din</button>':'')+
+   '<button onclick="act(\\'reject\\',\\''+c.utr+'\\')">Reject</button></div></div>').join(''):'<p>Koi claim nahi</p>';
+}
+async function act(a,utr){
+  const key=document.getElementById('k').value.trim();
+  await fetch('/api/admin/'+a,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key,utr})});
+  load();
+}
+document.getElementById('k').value=localStorage.x1akey||'';
+</script></body></html>"""
+
+
+@app.get("/admin")
+def admin_page():
+    return Response(ADMIN_HTML, mimetype="text/html")
 
 
 @app.post("/api/create-order")
@@ -239,7 +387,7 @@ def verify_payment():
     ).hexdigest()
 
     if hmac.compare_digest(expected, signature):
-        set_premium(current_uid())
+        grant_premium(current_uid())
         return jsonify({"success": True, "premium": True})
 
     return jsonify({"success": False, "error": "Signature mismatch"}), 400
@@ -275,7 +423,7 @@ def webhook():
             except requests.RequestException:
                 uid = None
         if uid:
-            set_premium(uid)
+            grant_premium(uid)
 
     return jsonify({"success": True})
 
@@ -296,8 +444,9 @@ def chat():
 
     uid = current_uid()
     user = get_user(uid)
+    p = is_premium(user)
 
-    if not user["premium"] and user["used"] >= FREE_LIMIT:
+    if not p and user["used"] >= FREE_LIMIT:
         return jsonify({
             "error": "premium_required",
             "premium_required": True,
@@ -322,12 +471,10 @@ def chat():
         content = item.get("content")
         if role not in ("user", "assistant"):
             continue
-
         if isinstance(content, str):
             if not content.strip():
                 continue
             messages.append({"role": role, "content": content.strip()[:8000]})
-
         elif isinstance(content, list):
             has_image = True
             messages.append({"role": role, "content": content})
@@ -365,7 +512,7 @@ def chat():
                 continue
             reply = choices[0].get("message", {}).get("content")
             if isinstance(reply, str) and reply.strip():
-                if not user["premium"]:
+                if not p:
                     bump_usage(uid)
                 return jsonify({"reply": reply.strip(), "model": model})
             last_error = f"{model}: Empty response"
