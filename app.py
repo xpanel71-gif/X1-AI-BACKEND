@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import json
 import hmac
 import hashlib
 import sqlite3
@@ -11,7 +12,7 @@ import requests
 from flask import Flask, jsonify, request, Response
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024
+app.config["MAX_CONTENT_LENGTH"] = 12 * 1024 * 1024
 
 API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 FRONTEND_ORIGIN = os.environ.get("FRONTEND_ORIGIN", "").rstrip("/")
@@ -27,6 +28,10 @@ PREMIUM_DAYS = int(os.environ.get("PREMIUM_DAYS", "30"))
 UTR_MODE = os.environ.get("UTR_MODE", "approve").strip().lower()
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "x1admin-9k3").strip()
 
+UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "").strip().rstrip("/")
+UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "").strip()
+USE_REDIS = bool(UPSTASH_URL and UPSTASH_TOKEN)
+
 RAZORPAY_KEY_ID = os.environ.get("RAZORPAY_KEY_ID", "").strip()
 RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET", "").strip()
 RAZORPAY_WEBHOOK_SECRET = os.environ.get("RAZORPAY_WEBHOOK_SECRET", "").strip()
@@ -36,9 +41,14 @@ MODELS = [
     "cognitivecomputations/dolphin-mistral-24b-venice-edition",
     "deepseek/deepseek-chat-v3-0324:free",
     "meta-llama/llama-3.3-70b-instruct:free",
+    "google/gemma-3-27b-it:free",
 ]
 VISION_MODELS = [
+    "google/gemma-3-12b-it:free",
     "meta-llama/llama-3.2-11b-vision-instruct:free",
+    "qwen/qwen2.5-vl-32b-instruct:free",
+    "mistralai/mistral-small-3.1-24b-instruct:free",
+    "meta-llama/llama-4-maverick:free",
     "qwen/qwen2.5-vl-72b-instruct:free",
 ]
 
@@ -68,6 +78,21 @@ MAX_REQUESTS = 30
 WINDOW_SECONDS = 60
 
 
+# ---------------- STORE ----------------
+
+def rcmd(*args):
+    try:
+        resp = requests.post(
+            UPSTASH_URL,
+            headers={"Authorization": "Bearer " + UPSTASH_TOKEN},
+            json=list(args),
+            timeout=10,
+        )
+        return resp.json().get("result")
+    except Exception:
+        return None
+
+
 def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -76,50 +101,90 @@ def db():
 
 def init_db():
     with closing(db()) as c:
-        c.execute("""CREATE TABLE IF NOT EXISTS users (
-            uid TEXT PRIMARY KEY,
-            premium INTEGER DEFAULT 0,
-            premium_until REAL DEFAULT 0,
-            used INTEGER DEFAULT 0,
-            created REAL
-        )""")
-        c.execute("""CREATE TABLE IF NOT EXISTS payments (
-            utr TEXT PRIMARY KEY,
-            uid TEXT,
-            ts REAL,
-            status TEXT DEFAULT 'pending'
-        )""")
-        for sql in (
-            "ALTER TABLE users ADD COLUMN premium_until REAL DEFAULT 0",
-            "ALTER TABLE payments ADD COLUMN status TEXT DEFAULT 'pending'",
-        ):
-            try:
-                c.execute(sql)
-            except sqlite3.OperationalError:
-                pass
+        c.execute("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, val TEXT)")
         c.commit()
 
 
-init_db()
+if not USE_REDIS:
+    init_db()
+
+
+def store_get(key):
+    if USE_REDIS:
+        v = rcmd("GET", key)
+        try:
+            return json.loads(v) if v else None
+        except ValueError:
+            return None
+    with closing(db()) as c:
+        row = c.execute("SELECT val FROM kv WHERE k=?", (key,)).fetchone()
+        try:
+            return json.loads(row["val"]) if row else None
+        except ValueError:
+            return None
+
+
+def store_set(key, obj):
+    if USE_REDIS:
+        rcmd("SET", key, json.dumps(obj))
+        return
+    with closing(db()) as c:
+        c.execute(
+            "INSERT INTO kv (k,val) VALUES (?,?) ON CONFLICT(k) DO UPDATE SET val=excluded.val",
+            (key, json.dumps(obj)),
+        )
+        c.commit()
+
+
+def claims_push(utr):
+    if USE_REDIS:
+        rcmd("LPUSH", "claims", utr)
+        return
+    idx = store_get("claims") or []
+    if utr not in idx:
+        idx.insert(0, utr)
+    store_set("claims", idx[:400])
+
+
+def claims_all():
+    if USE_REDIS:
+        return rcmd("LRANGE", "claims", 0, 199) or []
+    return store_get("claims") or []
+
+
+# ---------------- DAILY FREE LIMIT ----------------
+
+def today_key():
+    # IST (UTC+5:30) ke hisaab se din
+    return time.strftime("%Y-%m-%d", time.gmtime(time.time() + 19800))
+
+
+def seconds_to_reset():
+    now = time.time() + 19800
+    return int(86400 - (now % 86400))
 
 
 def get_user(uid):
-    with closing(db()) as c:
-        row = c.execute("SELECT * FROM users WHERE uid=?", (uid,)).fetchone()
-        if row:
-            return dict(row)
-        c.execute(
-            "INSERT INTO users (uid, premium, premium_until, used, created) VALUES (?, 0, 0, 0, ?)",
-            (uid, time.time()),
-        )
-        c.commit()
-        return {"uid": uid, "premium": 0, "premium_until": 0, "used": 0}
+    u = store_get("user:" + uid)
+    if not u:
+        u = {"premium_until": 0, "used": 0, "day": today_key()}
+        store_set("user:" + uid, u)
+    elif u.get("day") != today_key():
+        # naya din -> free messages reset
+        u["day"] = today_key()
+        u["used"] = 0
+        store_set("user:" + uid, u)
+    return u
+
+
+def save_user(uid, u):
+    store_set("user:" + uid, u)
 
 
 def bump_usage(uid):
-    with closing(db()) as c:
-        c.execute("UPDATE users SET used = used + 1 WHERE uid=?", (uid,))
-        c.commit()
+    u = get_user(uid)
+    u["used"] = int(u.get("used", 0)) + 1
+    save_user(uid, u)
 
 
 def is_premium(u):
@@ -127,20 +192,16 @@ def is_premium(u):
 
 
 def grant_premium(uid, days=None):
-    """Premium de do. Agar pehle se active hai to uske upar add hoga (renew)."""
     days = days or PREMIUM_DAYS
-    with closing(db()) as c:
-        row = c.execute("SELECT premium_until FROM users WHERE uid=?", (uid,)).fetchone()
-        base = time.time()
-        if row and (row["premium_until"] or 0) > base:
-            base = row["premium_until"]
-        until = base + days * 86400
-        c.execute(
-            "UPDATE users SET premium=1, premium_until=?, used=0 WHERE uid=?",
-            (until, uid),
-        )
-        c.commit()
-    return until
+    u = get_user(uid)
+    base = time.time()
+    if (u.get("premium_until") or 0) > base:
+        base = u["premium_until"]
+    u["premium_until"] = base + days * 86400
+    u["used"] = 0
+    save_user(uid, u)
+    store_set("pending:" + uid, "")
+    return u["premium_until"]
 
 
 def current_uid():
@@ -175,34 +236,27 @@ def guard():
     return None
 
 
+# ---------------- ROUTES ----------------
+
 @app.get("/api/status")
 def status():
     uid = current_uid()
     u = get_user(uid)
     p = is_premium(u)
-    remaining = 0 if p else max(0, FREE_LIMIT - u["used"])
     until = u.get("premium_until") or 0
-    days_left = 0
-    if p:
-        days_left = int(((until - time.time()) + 86399) // 86400)
-    pend = None
-    with closing(db()) as c:
-        row = c.execute(
-            "SELECT utr FROM payments WHERE uid=? AND status='pending'", (uid,)
-        ).fetchone()
-        if row:
-            pend = row["utr"]
+    days_left = int(((until - time.time()) + 86399) // 86400) if p else 0
     return jsonify({
         "premium": p,
         "days_left": days_left,
-        "premium_until": until,
-        "used": u["used"],
+        "used": u.get("used", 0),
         "limit": FREE_LIMIT,
-        "remaining": remaining,
+        "remaining": 0 if p else max(0, FREE_LIMIT - u.get("used", 0)),
+        "reset_in": 0 if p else seconds_to_reset(),
         "upi": UPI_ID,
         "upi_name": UPI_NAME,
         "price": PRICE_PAISE / 100,
-        "pending_utr": pend,
+        "pending_utr": store_get("pending:" + uid) or None,
+        "store": "redis" if USE_REDIS else "sqlite",
         "razorpay": bool(RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET),
     })
 
@@ -216,27 +270,23 @@ def claim():
         return jsonify({"success": False, "error": "UTR 12 digit ka hota hai"}), 400
 
     uid = current_uid()
+    rec = store_get("utr:" + utr)
 
-    with closing(db()) as c:
-        row = c.execute("SELECT uid, status FROM payments WHERE utr=?", (utr,)).fetchone()
+    if rec and rec.get("uid") != uid:
+        return jsonify({"success": False, "error": "Ye UTR pehle use ho chuka hai"}), 400
 
-        if row and row["uid"] != uid:
-            return jsonify({"success": False, "error": "Ye UTR pehle use ho chuka hai"}), 400
-
-        if row:
-            state = row["status"]
-        else:
-            state = "approved" if UTR_MODE == "instant" else "pending"
-            c.execute(
-                "INSERT INTO payments (utr, uid, ts, status) VALUES (?, ?, ?, ?)",
-                (utr, uid, time.time(), state),
-            )
-            c.commit()
+    if rec:
+        state = rec.get("status", "pending")
+    else:
+        state = "approved" if UTR_MODE == "instant" else "pending"
+        store_set("utr:" + utr, {"uid": uid, "status": state, "ts": time.time()})
+        claims_push(utr)
 
     if state == "approved":
         grant_premium(uid)
         return jsonify({"success": True, "pending": False, "premium": True})
 
+    store_set("pending:" + uid, utr)
     return jsonify({"success": True, "pending": True, "premium": False})
 
 
@@ -258,19 +308,20 @@ def admin_ok():
 def admin_list():
     if not admin_ok():
         return jsonify({"error": "Bad key"}), 401
-    with closing(db()) as c:
-        rows = c.execute(
-            """SELECT p.utr, p.uid, p.ts, p.status, u.premium_until
-               FROM payments p LEFT JOIN users u ON u.uid = p.uid
-               ORDER BY p.ts DESC LIMIT 200"""
-        ).fetchall()
     out = []
-    for r in rows:
-        d = dict(r)
-        until = d.pop("premium_until", 0) or 0
-        d["premium_days_left"] = int(((until - time.time()) + 86399) // 86400) if until > time.time() else 0
-        out.append(d)
-    return jsonify({"claims": out})
+    for utr in claims_all():
+        rec = store_get("utr:" + utr)
+        if not rec:
+            continue
+        u = get_user(rec.get("uid", ""))
+        until = u.get("premium_until") or 0
+        out.append({
+            "utr": utr,
+            "uid": rec.get("uid", ""),
+            "status": rec.get("status", "pending"),
+            "premium_days_left": int(((until - time.time()) + 86399) // 86400) if until > time.time() else 0,
+        })
+    return jsonify({"claims": out[:200]})
 
 
 @app.post("/api/admin/approve")
@@ -280,14 +331,12 @@ def admin_approve():
         return jsonify({"error": "Bad key"}), 401
     utr = re.sub(r"\D", "", str(body.get("utr", "")))
     days = int(body.get("days") or PREMIUM_DAYS)
-    with closing(db()) as c:
-        row = c.execute("SELECT uid FROM payments WHERE utr=?", (utr,)).fetchone()
-        if not row:
-            return jsonify({"error": "UTR nahi mila"}), 404
-        c.execute("UPDATE payments SET status='approved' WHERE utr=?", (utr,))
-        c.commit()
-        uid = row["uid"]
-    grant_premium(uid, days)
+    rec = store_get("utr:" + utr)
+    if not rec:
+        return jsonify({"error": "UTR nahi mila"}), 404
+    rec["status"] = "approved"
+    store_set("utr:" + utr, rec)
+    grant_premium(rec.get("uid", ""), days)
     return jsonify({"success": True, "days": days})
 
 
@@ -297,9 +346,7 @@ def admin_reject():
     if body.get("key", "") != ADMIN_KEY:
         return jsonify({"error": "Bad key"}), 401
     utr = re.sub(r"\D", "", str(body.get("utr", "")))
-    with closing(db()) as c:
-        c.execute("DELETE FROM payments WHERE utr=?", (utr,))
-        c.commit()
+    store_set("utr:" + utr, {"uid": "", "status": "rejected", "ts": time.time()})
     return jsonify({"success": True})
 
 
@@ -309,7 +356,7 @@ ADMIN_HTML = """<!DOCTYPE html><html><head><meta charset="utf-8">
 input,button{padding:10px;border-radius:9px;border:1px solid #232a3a;background:#0e1117;color:#e8eaf0;font-size:14px}
 button{background:linear-gradient(135deg,#22d3ee,#a78bfa);color:#080a0f;font-weight:600;border:none;cursor:pointer}
 .card{border:1px solid #1e2433;border-radius:11px;padding:12px;margin:10px 0;font-size:13px}
-.utr{font-family:monospace;font-size:16px;color:#22d3ee}.ok{color:#22c55e}.pend{color:#f59e0b}
+.utr{font-family:monospace;font-size:16px;color:#22d3ee}.ok{color:#22c55e}.pend{color:#f59e0b}.rej{color:#ef4444}
 .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.row input{flex:1}
 </style></head><body>
 <h2 style="margin-bottom:12px">X1 admin</h2>
@@ -322,7 +369,7 @@ async function load(){
   const j=await r.json();
   if(!j.claims){document.getElementById('out').innerHTML='<p>Bad key</p>';return;}
   document.getElementById('out').innerHTML=j.claims.length?j.claims.map(c=>
-   '<div class="card"><div class="utr">'+c.utr+'</div><div>uid: '+c.uid+'</div><div class="'+(c.status==='approved'?'ok':'pend')+'">'+c.status+
+   '<div class="card"><div class="utr">'+c.utr+'</div><div>uid: '+c.uid+'</div><div class="'+(c.status==='approved'?'ok':c.status==='rejected'?'rej':'pend')+'">'+c.status+
    (c.premium_days_left?' &middot; '+c.premium_days_left+' din baaki':'')+'</div><div class="row" style="margin-top:8px">'+
    (c.status==='pending'?'<button onclick="act(\\'approve\\',\\''+c.utr+'\\')">Approve 30 din</button>':'')+
    '<button onclick="act(\\'reject\\',\\''+c.utr+'\\')">Reject</button></div></div>').join(''):'<p>Koi claim nahi</p>';
@@ -349,23 +396,15 @@ def create_order():
         r = requests.post(
             "https://api.razorpay.com/v1/orders",
             auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET),
-            json={
-                "amount": PRICE_PAISE,
-                "currency": "INR",
-                "receipt": current_uid()[:40],
-                "notes": {"uid": current_uid()},
-            },
+            json={"amount": PRICE_PAISE, "currency": "INR",
+                  "receipt": current_uid()[:40], "notes": {"uid": current_uid()}},
             timeout=20,
         )
         if not r.ok:
             return jsonify({"configured": True, "error": r.text}), 502
         o = r.json()
-        return jsonify({
-            "configured": True,
-            "order_id": o["id"],
-            "amount": PRICE_PAISE,
-            "key": RAZORPAY_KEY_ID,
-        })
+        return jsonify({"configured": True, "order_id": o["id"],
+                        "amount": PRICE_PAISE, "key": RAZORPAY_KEY_ID})
     except requests.RequestException as exc:
         return jsonify({"configured": True, "error": str(exc)}), 502
 
@@ -376,20 +415,13 @@ def verify_payment():
     order_id = body.get("razorpay_order_id", "")
     payment_id = body.get("razorpay_payment_id", "")
     signature = body.get("razorpay_signature", "")
-
     if not (order_id and payment_id and signature):
         return jsonify({"success": False, "error": "Missing fields"}), 400
-
-    expected = hmac.new(
-        RAZORPAY_KEY_SECRET.encode(),
-        f"{order_id}|{payment_id}".encode(),
-        hashlib.sha256,
-    ).hexdigest()
-
+    expected = hmac.new(RAZORPAY_KEY_SECRET.encode(),
+                        f"{order_id}|{payment_id}".encode(), hashlib.sha256).hexdigest()
     if hmac.compare_digest(expected, signature):
         grant_premium(current_uid())
         return jsonify({"success": True, "premium": True})
-
     return jsonify({"success": False, "error": "Signature mismatch"}), 400
 
 
@@ -397,34 +429,24 @@ def verify_payment():
 def webhook():
     raw = request.get_data()
     sig = request.headers.get("X-Razorpay-Signature", "")
-
     if RAZORPAY_WEBHOOK_SECRET:
-        expected = hmac.new(
-            RAZORPAY_WEBHOOK_SECRET.encode(), raw, hashlib.sha256
-        ).hexdigest()
+        expected = hmac.new(RAZORPAY_WEBHOOK_SECRET.encode(), raw, hashlib.sha256).hexdigest()
         if not hmac.compare_digest(expected, sig):
             return jsonify({"success": False}), 400
-
     data = request.get_json(silent=True) or {}
     if data.get("event") in ("payment.captured", "order.paid"):
-        entity = (
-            (data.get("payload", {}) or {}).get("payment", {}) or {}
-        ).get("entity", {}) or {}
+        entity = ((data.get("payload", {}) or {}).get("payment", {}) or {}).get("entity", {}) or {}
         uid = (entity.get("notes") or {}).get("uid")
         order_id = entity.get("order_id")
         if not uid and order_id and RAZORPAY_KEY_ID:
             try:
-                r = requests.get(
-                    f"https://api.razorpay.com/v1/orders/{order_id}",
-                    auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET),
-                    timeout=20,
-                )
-                uid = (r.json().get("notes") or {}).get("uid")
+                rr = requests.get(f"https://api.razorpay.com/v1/orders/{order_id}",
+                                  auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET), timeout=20)
+                uid = (rr.json().get("notes") or {}).get("uid")
             except requests.RequestException:
                 uid = None
         if uid:
             grant_premium(uid)
-
     return jsonify({"success": True})
 
 
@@ -446,12 +468,9 @@ def chat():
     user = get_user(uid)
     p = is_premium(user)
 
-    if not p and user["used"] >= FREE_LIMIT:
-        return jsonify({
-            "error": "premium_required",
-            "premium_required": True,
-            "limit": FREE_LIMIT,
-        }), 402
+    if not p and user.get("used", 0) >= FREE_LIMIT:
+        return jsonify({"error": "premium_required", "premium_required": True,
+                        "limit": FREE_LIMIT, "reset_in": seconds_to_reset()}), 402
 
     body = request.get_json(silent=True)
     if not isinstance(body, dict):
@@ -464,7 +483,7 @@ def chat():
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     has_image = False
 
-    for item in incoming[-20:]:
+    for item in incoming[-12:]:
         if not isinstance(item, dict):
             continue
         role = item.get("role")
@@ -489,21 +508,14 @@ def chat():
         try:
             response = requests.post(
                 "https://openrouter.ai/api/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {API_KEY}",
-                    "Content-Type": "application/json",
-                    "X-Title": "X1 AI",
-                },
-                json={
-                    "model": model,
-                    "messages": messages,
-                    "temperature": 0.6,
-                    "max_tokens": 4096,
-                },
-                timeout=90,
+                headers={"Authorization": f"Bearer {API_KEY}",
+                         "Content-Type": "application/json", "X-Title": "X1 AI"},
+                json={"model": model, "messages": messages,
+                      "temperature": 0.6, "max_tokens": 4096},
+                timeout=120,
             )
             if not response.ok:
-                last_error = f"{model}: HTTP {response.status_code}"
+                last_error = f"{model}: HTTP {response.status_code} {response.text[:90]}"
                 continue
             data = response.json()
             choices = data.get("choices", [])
@@ -521,12 +533,14 @@ def chat():
             continue
 
     app.logger.warning("X1 model chain failed: %s", last_error)
-    return jsonify({"error": "AI provider unavailable. Try again later."}), 502
+    return jsonify({"error": "AI provider unavailable. Try again later.",
+                    "detail": last_error}), 502
 
 
 @app.get("/")
 def home():
-    return jsonify({"success": True, "server": "X1 AI Backend", "status": "online"})
+    return jsonify({"success": True, "server": "X1 AI Backend",
+                    "store": "redis" if USE_REDIS else "sqlite"})
 
 
 if __name__ == "__main__":
