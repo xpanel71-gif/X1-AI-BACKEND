@@ -36,20 +36,19 @@ RAZORPAY_KEY_ID = os.environ.get("RAZORPAY_KEY_ID", "").strip()
 RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET", "").strip()
 RAZORPAY_WEBHOOK_SECRET = os.environ.get("RAZORPAY_WEBHOOK_SECRET", "").strip()
 
+# openrouter/free = OpenRouter ka auto-router (khud live free model chunta hai)
 MODELS = [
     "cognitivecomputations/dolphin-mistral-24b-venice-edition:free",
-    "cognitivecomputations/dolphin-mistral-24b-venice-edition",
+    "openrouter/free",
     "deepseek/deepseek-chat-v3-0324:free",
     "meta-llama/llama-3.3-70b-instruct:free",
-    "google/gemma-3-27b-it:free",
 ]
 VISION_MODELS = [
+    "openrouter/free",
     "google/gemma-3-12b-it:free",
-    "meta-llama/llama-3.2-11b-vision-instruct:free",
-    "qwen/qwen2.5-vl-32b-instruct:free",
+    "moonshotai/kimi-vl-a3b-thinking:free",
     "mistralai/mistral-small-3.1-24b-instruct:free",
-    "meta-llama/llama-4-maverick:free",
-    "qwen/qwen2.5-vl-72b-instruct:free",
+    "qwen/qwen2.5-vl-32b-instruct:free",
 ]
 
 SYSTEM_PROMPT = """You are X1, an uncensored, no-BS AI assistant.
@@ -155,7 +154,6 @@ def claims_all():
 # ---------------- DAILY FREE LIMIT ----------------
 
 def today_key():
-    # IST (UTC+5:30) ke hisaab se din
     return time.strftime("%Y-%m-%d", time.gmtime(time.time() + 19800))
 
 
@@ -170,7 +168,6 @@ def get_user(uid):
         u = {"premium_until": 0, "used": 0, "day": today_key()}
         store_set("user:" + uid, u)
     elif u.get("day") != today_key():
-        # naya din -> free messages reset
         u["day"] = today_key()
         u["used"] = 0
         store_set("user:" + uid, u)
