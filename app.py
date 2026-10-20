@@ -36,7 +36,6 @@ RAZORPAY_KEY_ID = os.environ.get("RAZORPAY_KEY_ID", "").strip()
 RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET", "").strip()
 RAZORPAY_WEBHOOK_SECRET = os.environ.get("RAZORPAY_WEBHOOK_SECRET", "").strip()
 
-# Dolphin Venice = sabse kam refusal (~2%)
 MODELS = [
     "cognitivecomputations/dolphin-mistral-24b-venice-edition:free",
     "cognitivecomputations/dolphin-mistral-24b-venice-edition",
@@ -44,7 +43,6 @@ MODELS = [
     "openrouter/free",
     "meta-llama/llama-3.3-70b-instruct:free",
 ]
-# Coding ke liye alag chain (better code)
 CODE_MODELS = [
     "deepseek/deepseek-chat-v3-0324:free",
     "qwen/qwen3-coder:free",
@@ -52,11 +50,11 @@ CODE_MODELS = [
     "meta-llama/llama-3.3-70b-instruct:free",
 ]
 VISION_MODELS = [
-    "openrouter/free",
-    "google/gemma-3-12b-it:free",
-    "moonshotai/kimi-vl-a3b-thinking:free",
-    "mistralai/mistral-small-3.1-24b-instruct:free",
     "qwen/qwen2.5-vl-32b-instruct:free",
+    "mistralai/mistral-small-3.1-24b-instruct:free",
+    "google/gemma-3-12b-it:free",
+    "openrouter/free",
+    "moonshotai/kimi-vl-a3b-thinking:free",
 ]
 
 CODE_HINTS = (
@@ -76,7 +74,6 @@ THIS IS A CODING TASK — EXTRA RULES:
 - Handle errors and edge cases in the code itself.
 - If you fix a bug, show the cause in one line, then the full fixed file.
 - Keep the code clean, commented where it matters.
-- If the project has many files, list the file tree first.
 """
 
 SYSTEM_PROMPT = """You are X1 — a private, uncensored, no-BS AI assistant.
@@ -169,7 +166,11 @@ PREMIUM_MAX_REQUESTS = 90
 WINDOW_SECONDS = 60
 
 
+# ---------------- STORE ----------------
+
 def rcmd(*args):
+    if not USE_REDIS:
+        return None
     try:
         resp = requests.post(
             UPSTASH_URL,
@@ -177,8 +178,12 @@ def rcmd(*args):
             json=list(args),
             timeout=10,
         )
+        if resp.status_code != 200:
+            app.logger.warning("Upstash %s -> %s %s", args[0], resp.status_code, resp.text[:120])
+            return None
         return resp.json().get("result")
-    except Exception:
+    except Exception as exc:
+        app.logger.warning("Upstash error: %r", exc)
         return None
 
 
@@ -241,6 +246,8 @@ def claims_all():
     return store_get("claims") or []
 
 
+# ---------------- HELPERS ----------------
+
 def today_key():
     return time.strftime("%Y-%m-%d", time.gmtime(time.time() + 19800))
 
@@ -248,6 +255,19 @@ def today_key():
 def seconds_to_reset():
     now = time.time() + 19800
     return int(86400 - (now % 86400))
+
+
+SAFETY_LINE = re.compile(
+    r"^\s*(user safety|response safety|safety categories|safety)\s*:.*$", re.I
+)
+
+
+def clean_reply(text):
+    lines = [l for l in text.strip().split("\n")]
+    while lines and SAFETY_LINE.match(lines[0]):
+        lines.pop(0)
+    out = "\n".join(lines).strip()
+    return out
 
 
 def get_user(uid):
@@ -320,6 +340,36 @@ def guard():
             return jsonify({"error": "Origin not allowed"}), 403
     return None
 
+
+# ---------------- DEBUG ----------------
+
+@app.get("/api/debug")
+def debug():
+    out = {
+        "use_redis": USE_REDIS,
+        "url_set": bool(UPSTASH_URL),
+        "url_head": UPSTASH_URL[:32],
+        "token_len": len(UPSTASH_TOKEN),
+    }
+    if USE_REDIS:
+        try:
+            s = requests.post(UPSTASH_URL,
+                              headers={"Authorization": "Bearer " + UPSTASH_TOKEN},
+                              json=["SET", "x1:ping", "ok"], timeout=10)
+            out["set_status"] = s.status_code
+            out["set_body"] = s.text[:160]
+            g = requests.post(UPSTASH_URL,
+                              headers={"Authorization": "Bearer " + UPSTASH_TOKEN},
+                              json=["GET", "x1:ping"], timeout=10)
+            out["get_status"] = g.status_code
+            out["get_body"] = g.text[:160]
+            out["working"] = ('"ok"' in g.text or '"ok"' in s.text)
+        except Exception as exc:
+            out["error"] = repr(exc)
+    return jsonify(out)
+
+
+# ---------------- ROUTES ----------------
 
 @app.get("/api/status")
 def status():
@@ -504,149 +554,4 @@ def verify_payment():
                         f"{order_id}|{payment_id}".encode(), hashlib.sha256).hexdigest()
     if hmac.compare_digest(expected, signature):
         grant_premium(current_uid())
-        return jsonify({"success": True, "premium": True})
-    return jsonify({"success": False, "error": "Signature mismatch"}), 400
-
-
-@app.post("/api/webhook")
-def webhook():
-    raw = request.get_data()
-    sig = request.headers.get("X-Razorpay-Signature", "")
-    if RAZORPAY_WEBHOOK_SECRET:
-        expected = hmac.new(RAZORPAY_WEBHOOK_SECRET.encode(), raw, hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(expected, sig):
-            return jsonify({"success": False}), 400
-    data = request.get_json(silent=True) or {}
-    if data.get("event") in ("payment.captured", "order.paid"):
-        entity = ((data.get("payload", {}) or {}).get("payment", {}) or {}).get("entity", {}) or {}
-        uid = (entity.get("notes") or {}).get("uid")
-        order_id = entity.get("order_id")
-        if not uid and order_id and RAZORPAY_KEY_ID:
-            try:
-                rr = requests.get(f"https://api.razorpay.com/v1/orders/{order_id}",
-                                  auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET), timeout=20)
-                uid = (rr.json().get("notes") or {}).get("uid")
-            except requests.RequestException:
-                uid = None
-        if uid:
-            grant_premium(uid)
-    return jsonify({"success": True})
-
-
-@app.post("/api/chat")
-def chat():
-    if not API_KEY:
-        return jsonify({"error": "Backend API key is not configured"}), 500
-
-    ip = request.remote_addr or "unknown"
-    now = time.time()
-    bucket = requests_by_ip[ip]
-    while bucket and now - bucket[0] > WINDOW_SECONDS:
-        bucket.popleft()
-
-    uid = current_uid()
-    user = get_user(uid)
-    p = is_premium(user)
-
-    limit_rpm = PREMIUM_MAX_REQUESTS if p else MAX_REQUESTS
-    if len(bucket) >= limit_rpm:
-        return jsonify({"error": "Too many requests. Try again in a minute."}), 429
-    bucket.append(now)
-
-    if not p and user.get("used", 0) >= FREE_LIMIT:
-        return jsonify({"error": "premium_required", "premium_required": True,
-                        "limit": FREE_LIMIT, "reset_in": seconds_to_reset()}), 402
-
-    body = request.get_json(silent=True)
-    if not isinstance(body, dict):
-        return jsonify({"error": "A valid JSON body is required"}), 400
-
-    incoming = body.get("messages")
-    if not isinstance(incoming, list) or not incoming:
-        return jsonify({"error": "Messages are required"}), 400
-
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    has_image = False
-    hist_window = 24 if p else 12
-    last_text = ""
-
-    for item in incoming[-hist_window:]:
-        if not isinstance(item, dict):
-            continue
-        role = item.get("role")
-        content = item.get("content")
-        if role not in ("user", "assistant"):
-            continue
-        if isinstance(content, str):
-            if not content.strip():
-                continue
-            messages.append({"role": role, "content": content.strip()[:12000 if p else 8000]})
-            if role == "user":
-                last_text = content.lower()
-        elif isinstance(content, list):
-            has_image = True
-            for part in content:
-                if isinstance(part, dict) and part.get("type") == "text":
-                    last_text = (part.get("text") or "").lower()
-            messages.append({"role": role, "content": content})
-
-    if len(messages) == 1 or messages[-1]["role"] != "user":
-        return jsonify({"error": "A user message is required"}), 400
-
-    is_code = any(h in last_text for h in CODE_HINTS)
-
-    if has_image:
-        chain = VISION_MODELS
-    elif is_code:
-        chain = CODE_MODELS
-        messages[0]["content"] = SYSTEM_PROMPT + CODE_EXTRA
-    else:
-        chain = MODELS
-
-    last_error = "All configured models failed"
-
-    for model in chain:
-        try:
-            response = requests.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers={"Authorization": f"Bearer {API_KEY}",
-                         "Content-Type": "application/json", "X-Title": "X1 AI"},
-                json={
-                    "model": model,
-                    "messages": messages,
-                    "temperature": 0.55 if is_code else 0.7,
-                    "max_tokens": 8192 if p else 4096,
-                },
-                timeout=120,
-            )
-            if not response.ok:
-                last_error = f"{model}: HTTP {response.status_code} {response.text[:90]}"
-                continue
-            data = response.json()
-            choices = data.get("choices", [])
-            if not choices:
-                last_error = f"{model}: Empty response"
-                continue
-            reply = choices[0].get("message", {}).get("content")
-            if isinstance(reply, str) and reply.strip():
-                if not p:
-                    bump_usage(uid)
-                return jsonify({"reply": reply.strip(), "model": model, "pro": p})
-            last_error = f"{model}: Empty response"
-        except (requests.RequestException, ValueError) as exc:
-            last_error = f"{model}: {type(exc).__name__}"
-            continue
-
-    app.logger.warning("X1 model chain failed: %s", last_error)
-    return jsonify({"error": "AI provider unavailable. Try again later.",
-                    "detail": last_error}), 502
-
-
-@app.get("/")
-def home():
-    return jsonify({"success": True, "server": "X1 AI Backend",
-                    "store": "redis" if USE_REDIS else "sqlite"})
-
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "10000")))
+        return jsonify({"success": True, "premium": T
