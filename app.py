@@ -18,9 +18,20 @@ PRICE_PAISE = int(os.environ.get("PRICE_PAISE", "9900"))
 PREMIUM_DAYS = int(os.environ.get("PREMIUM_DAYS", "30"))
 UTR_MODE = os.environ.get("UTR_MODE", "approve").strip().lower()
 ADMIN_KEY = os.environ.get("ADMIN_KEY", "x1admin-9k3").strip()
-UPSTASH_URL = os.environ.get("UPSTASH_REDIS_REST_URL", "").strip().rstrip("/")
-UPSTASH_TOKEN = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "").strip()
+
+
+def _env(name):
+    v = os.environ.get(name, "").strip().strip('"').strip("'")
+    if v.startswith(name):
+        v = v[len(name):].lstrip("=").strip().strip('"').strip("'")
+    return v
+
+
+UPSTASH_URL = _env("UPSTASH_REDIS_REST_URL").rstrip("/")
+UPSTASH_TOKEN = _env("UPSTASH_REDIS_REST_TOKEN")
 USE_REDIS = bool(UPSTASH_URL and UPSTASH_TOKEN)
+REDIS_OK = USE_REDIS
+
 RZP_ID = os.environ.get("RAZORPAY_KEY_ID", "").strip()
 RZP_SECRET = os.environ.get("RAZORPAY_KEY_SECRET", "").strip()
 RZP_HOOK = os.environ.get("RAZORPAY_WEBHOOK_SECRET", "").strip()
@@ -134,18 +145,21 @@ PRO_RPM = 90
 
 
 def rcmd(*args):
-    if not USE_REDIS:
+    global REDIS_OK
+    if not REDIS_OK:
         return None
     try:
         r = requests.post(UPSTASH_URL,
                           headers={"Authorization": "Bearer " + UPSTASH_TOKEN},
                           json=list(args), timeout=10)
         if r.status_code != 200:
-            app.logger.warning("upstash %s -> %s", args[0], r.status_code)
+            app.logger.warning("upstash %s -> %s %s", args[0], r.status_code, r.text[:100])
+            REDIS_OK = False
             return None
         return r.json().get("result")
     except Exception as exc:
         app.logger.warning("upstash err %r", exc)
+        REDIS_OK = False
         return None
 
 
@@ -161,17 +175,17 @@ def init_db():
         c.commit()
 
 
-if not USE_REDIS:
-    init_db()
+init_db()
 
 
 def sget(key):
-    if USE_REDIS:
+    if REDIS_OK:
         v = rcmd("GET", key)
-        try:
-            return json.loads(v) if v else None
-        except ValueError:
-            return None
+        if REDIS_OK:
+            try:
+                return json.loads(v) if v else None
+            except ValueError:
+                return None
     with closing(db()) as c:
         row = c.execute("SELECT val FROM kv WHERE k=?", (key,)).fetchone()
         try:
@@ -181,9 +195,10 @@ def sget(key):
 
 
 def sset(key, obj):
-    if USE_REDIS:
+    if REDIS_OK:
         rcmd("SET", key, json.dumps(obj))
-        return
+        if REDIS_OK:
+            return
     with closing(db()) as c:
         c.execute("INSERT INTO kv (k,val) VALUES (?,?) "
                   "ON CONFLICT(k) DO UPDATE SET val=excluded.val",
@@ -268,26 +283,21 @@ def guard():
 @app.get("/")
 def home():
     return jsonify({"success": True, "server": "X1 AI Backend",
-                    "store": "redis" if USE_REDIS else "sqlite"})
+                    "store": "redis" if REDIS_OK else "sqlite"})
 
 
 @app.get("/api/debug")
 def debug():
-    out = {"use_redis": USE_REDIS, "token_len": len(UPSTASH_TOKEN),
-           "url_head": UPSTASH_URL[:32]}
+    out = {"token_len": len(UPSTASH_TOKEN), "token_head": UPSTASH_TOKEN[:8],
+           "token_tail": UPSTASH_TOKEN[-4:], "url": UPSTASH_URL,
+           "redis_ok": REDIS_OK, "use_redis": USE_REDIS}
     if USE_REDIS:
         try:
             s = requests.post(UPSTASH_URL,
                               headers={"Authorization": "Bearer " + UPSTASH_TOKEN},
                               json=["SET", "x1:ping", "ok"], timeout=10)
             out["set_status"] = s.status_code
-            out["set_body"] = s.text[:150]
-            g = requests.post(UPSTASH_URL,
-                              headers={"Authorization": "Bearer " + UPSTASH_TOKEN},
-                              json=["GET", "x1:ping"], timeout=10)
-            out["get_status"] = g.status_code
-            out["get_body"] = g.text[:150]
-            out["working"] = "ok" in g.text
+            out["set_body"] = s.text[:120]
         except Exception as exc:
             out["error"] = repr(exc)
     return jsonify(out)
@@ -307,7 +317,7 @@ def status():
         "reset_in": 0 if p else reset_in(),
         "upi": UPI_ID, "upi_name": UPI_NAME, "price": PRICE_PAISE / 100,
         "pending_utr": sget("pend:" + uid) or None,
-        "store": "redis" if USE_REDIS else "sqlite",
+        "store": "redis" if REDIS_OK else "sqlite",
         "razorpay": bool(RZP_ID and RZP_SECRET),
     })
 
