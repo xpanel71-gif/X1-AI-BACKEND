@@ -2,11 +2,11 @@
 #  X1 — Unrestricted AI  |  Backend
 #  Brand: X1 / X1 PRO  |  UPI: 9625399958@fam
 #  Stack: Flask + OpenRouter + Upstash Redis (+ SQLite fallback)
-#  Features: chat, vision, code routing, video gen, UPI PRO,
-#            admin approve, 7 free/day, 30-day premium
+#  Features: chat, vision, code routing, web search, video gen,
+#            UPI PRO, admin approve, 7 free/day, 30-day premium
 # ==========================================================
 import os, re, json, time, uuid, sqlite3, threading
-import urllib.request, urllib.parse
+import urllib.request, urllib.parse, urllib.error
 from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify, send_from_directory
 
@@ -284,8 +284,9 @@ def api_status():
 def api_chat():
     data = request.get_json(silent=True) or {}
     msg = (data.get("message") or "").strip()
-    image = data.get("image") or None            # data URL
+    image = data.get("image") or None
     history = data.get("history") or []
+    use_search = bool(data.get("search"))
     uid = uid_of()
     u, premium, used, remaining = state(uid)
 
@@ -298,7 +299,6 @@ def api_chat():
     if not OPENROUTER_KEY:
         return jsonify({"ok": False, "error": "server key missing"}), 500
 
-    # build messages
     low = msg.lower()
     is_code = any(h in low for h in CODE_HINTS)
     if image:
@@ -315,6 +315,19 @@ def api_chat():
         c = h.get("content")
         if r in ("user", "assistant") and c:
             msgs.append({"role": r, "content": c})
+
+    sources = []
+    if use_search and msg:
+        results, src = web_search(msg, 5)
+        if results:
+            sources = results
+            ctx = "\n\n".join(
+                "[%d] %s\n%s\n%s" % (i + 1, r["title"], r["url"], r["snippet"])
+                for i, r in enumerate(results))
+            msgs.append({"role": "system", "content":
+                "LIVE WEB RESULTS (source: %s, fetched just now). Treat these as fresh facts. "
+                "Use them, and mention the source link when it helps. "
+                "If the results look outdated, say so.\n\n%s" % (src, ctx)})
 
     if image:
         content = [{"type": "text", "text": msg or "Describe this image in detail."},
@@ -347,8 +360,10 @@ def api_chat():
     return jsonify({
         "ok": True, "reply": reply, "model": used_model,
         "label": short_model(used_model), "premium": premium,
-        "used": u["used"], "remaining": max(0, FREE_LIMIT - u["used"]) if not premium else 999999,
+        "used": u["used"],
+        "remaining": max(0, FREE_LIMIT - u["used"]) if not premium else 999999,
         "limit": FREE_LIMIT,
+        "sources": sources,
     })
 
 # ---------------- PREMIUM (UPI + UTR) ----------------
@@ -491,6 +506,65 @@ def admin_act():
             "<h3>%s — %s</h3><a style='color:#7ce7ff' href='/admin?key=%s'>back to admin</a></body>"
             % (do.upper(), utr, ADMIN_KEY))
 
+# ---------------- WEB SEARCH (free, no API key) ----------------
+UA = ("Mozilla/5.0 (Linux; Android 13; SM-G991B) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/122.0 Mobile Safari/537.36")
+
+def _strip(s):
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", s or "")).strip()
+
+def ddg_search(q, n=5):
+    url = "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote(q)
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        h = r.read().decode("utf-8", "ignore")
+    items = re.findall(r'result__a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', h, re.S)
+    snips = re.findall(r'result__snippet[^>]*>(.*?)</a>', h, re.S)
+    out = []
+    for i, (link, title) in enumerate(items[:n]):
+        m = re.search(r"uddg=([^&]+)", link)
+        real = urllib.parse.unquote(m.group(1)) if m else link
+        out.append({"title": _strip(title), "url": real,
+                    "snippet": _strip(snips[i]) if i < len(snips) else ""})
+    return out
+
+def wiki_search(q, n=4):
+    url = ("https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch="
+           + urllib.parse.quote(q) + "&format=json&srlimit=%d" % n)
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=12) as r:
+        d = json.loads(r.read().decode("utf-8", "ignore"))
+    out = []
+    for it in (d.get("query", {}).get("search") or []):
+        t = it.get("title", "")
+        out.append({"title": t,
+                    "url": "https://en.wikipedia.org/wiki/" + urllib.parse.quote(t.replace(" ", "_")),
+                    "snippet": _strip(it.get("snippet", ""))})
+    return out
+
+def web_search(q, n=5):
+    try:
+        r = ddg_search(q, n)
+        if r:
+            return r, "duckduckgo"
+    except Exception:
+        pass
+    try:
+        r = wiki_search(q, 4)
+        if r:
+            return r, "wikipedia"
+    except Exception:
+        pass
+    return [], "none"
+
+@app.route("/api/search")
+def api_search():
+    q = (request.args.get("q") or "").strip()
+    if not q:
+        return jsonify({"ok": False, "error": "q missing"}), 400
+    res, src = web_search(q, 5)
+    return jsonify({"ok": True, "source": src, "results": res})
+
 # ---------------- VIDEO (Hugging Face) ----------------
 VIDEO_T2V = [
     "https://router.huggingface.co/fal-ai/fal-ai/wan-t2v",
@@ -572,11 +646,8 @@ def serve_video(name):
 @app.route("/api/debug")
 def api_debug():
     out = {
-        "redis_ok": REDIS_OK,
         "url": UPSTASH_URL[:40] if UPSTASH_URL else "",
         "token_len": len(UPSTASH_TOKEN),
-        "token_head": UPSTASH_TOKEN[:8],
-        "token_tail": UPSTASH_TOKEN[-3:],
         "use_redis": bool(UPSTASH_URL and UPSTASH_TOKEN),
         "hf": bool(HF_TOKEN),
         "openrouter": bool(OPENROUTER_KEY),
@@ -586,15 +657,20 @@ def api_debug():
     }
     if UPSTASH_URL and UPSTASH_TOKEN:
         try:
-            _redis_cmd("set", "x1:ping", "ok")
+            store_set("x1:ping", "ok")
+            out["redis_ok"] = True
             out["set_status"] = 200
-            out["get"] = _redis_cmd("get", "x1:ping")
+            out["get"] = {"result": store_get("x1:ping")}
         except urllib.error.HTTPError as e:
+            out["redis_ok"] = False
             out["set_status"] = e.code
             out["set_body"] = e.read().decode("utf-8", "ignore")[:200]
         except Exception as e:
+            out["redis_ok"] = False
             out["set_status"] = "err"
             out["set_body"] = str(e)[:200]
+    else:
+        out["redis_ok"] = False
     return jsonify(out)
 
 if __name__ == "__main__":
