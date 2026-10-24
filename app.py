@@ -544,4 +544,59 @@ def api_video():
                 "Authorization": "Bearer " + HF_TOKEN,
                 "Content-Type": "application/json"})
             with urllib.request.urlopen(req, timeout=240) as r:
-        
+                ctype = (r.headers.get("Content-Type") or "").lower()
+                raw = r.read()
+            os.makedirs(VIDEO_DIR, exist_ok=True)
+            if "json" in ctype:
+                obj = json.loads(raw.decode("utf-8", "ignore"))
+                link = _find_url(obj)
+                if not link:
+                    last = "no video url in response"
+                    continue
+                with urllib.request.urlopen(link, timeout=180) as r2:
+                    raw = r2.read()
+            name = "x1vid_" + uuid.uuid4().hex[:10] + ".mp4"
+            with open(os.path.join(VIDEO_DIR, name), "wb") as f:
+                f.write(raw)
+            return jsonify({"ok": True, "url": "/vid/" + name, "model": url.split("/")[-1]})
+        except Exception as e:
+            last = str(e)[:180]
+            continue
+    return jsonify({"ok": False, "error": last or "video fail"}), 502
+
+@app.route("/vid/<name>")
+def serve_video(name):
+    return send_from_directory(VIDEO_DIR, name, mimetype="video/mp4")
+
+# ---------------- DEBUG ----------------
+@app.route("/api/debug")
+def api_debug():
+    out = {
+        "redis_ok": REDIS_OK,
+        "url": UPSTASH_URL[:40] if UPSTASH_URL else "",
+        "token_len": len(UPSTASH_TOKEN),
+        "token_head": UPSTASH_TOKEN[:8],
+        "token_tail": UPSTASH_TOKEN[-3:],
+        "use_redis": bool(UPSTASH_URL and UPSTASH_TOKEN),
+        "hf": bool(HF_TOKEN),
+        "openrouter": bool(OPENROUTER_KEY),
+        "admin_key": ADMIN_KEY,
+        "upi": UPI_ID,
+        "utr_mode": UTR_MODE,
+    }
+    if UPSTASH_URL and UPSTASH_TOKEN:
+        try:
+            _redis_cmd("set", "x1:ping", "ok")
+            out["set_status"] = 200
+            out["get"] = _redis_cmd("get", "x1:ping")
+        except urllib.error.HTTPError as e:
+            out["set_status"] = e.code
+            out["set_body"] = e.read().decode("utf-8", "ignore")[:200]
+        except Exception as e:
+            out["set_status"] = "err"
+            out["set_body"] = str(e)[:200]
+    return jsonify(out)
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+# X1 — END
