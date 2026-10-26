@@ -19,6 +19,18 @@ app = Flask(__name__)
 if CORS:
     CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 
+# --- bulletproof CORS (flask-cors ho ya na ho, ye chalega) ---
+@app.after_request
+def _cors(resp):
+    o = request.headers.get("Origin") or "*"
+    resp.headers["Access-Control-Allow-Origin"] = o
+    resp.headers["Access-Control-Allow-Credentials"] = "true"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-User-Id, Authorization"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    resp.headers["Access-Control-Max-Age"] = "86400"
+    resp.headers["Vary"] = "Origin"
+    return resp
+
 # ---------------- CONFIG ----------------
 def _env(name, default=""):
     v = os.environ.get(name, default) or ""
@@ -128,6 +140,8 @@ def reset_in():
 
 def uid_of():
     uid = (request.headers.get("X-User-Id") or "").strip()
+    if not uid:
+        uid = (request.args.get("uid") or "").strip()
     if not uid:
         uid = request.cookies.get("x1uid") or "anon"
     return uid[:64]
@@ -266,6 +280,10 @@ def or_chat(model, messages, max_tokens):
 @app.route("/")
 def home():
     return jsonify({"ok": True, "app": "X1", "store": "redis" if REDIS_OK else "sqlite"})
+
+@app.route("/api/ping")
+def api_ping():
+    return jsonify({"ok": True, "pong": int(time.time())})
 
 @app.route("/api/status")
 def api_status():
@@ -654,6 +672,7 @@ def api_debug():
         "admin_key": ADMIN_KEY,
         "upi": UPI_ID,
         "utr_mode": UTR_MODE,
+        "flask_cors": bool(CORS),
     }
     if UPSTASH_URL and UPSTASH_TOKEN:
         try:
